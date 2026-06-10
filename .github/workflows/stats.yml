@@ -5,6 +5,15 @@ on:
     - cron: "0 6 * * *"
     - cron: "0 0,12,18 * * *"
   workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Режим запуска'
+        required: false
+        default: 'daily'
+        type: choice
+        options:
+          - daily
+          - check
 
 jobs:
   send-stats:
@@ -25,11 +34,15 @@ jobs:
       - name: Determine run mode
         id: mode
         run: |
-          HOUR=$(date -u +%H)
-          if [ "$HOUR" = "06" ]; then
-            echo "mode=daily" >> $GITHUB_OUTPUT
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "mode=${{ inputs.mode }}" >> $GITHUB_OUTPUT
           else
-            echo "mode=check" >> $GITHUB_OUTPUT
+            HOUR=$(date -u +%H)
+            if [ "$HOUR" = "06" ]; then
+              echo "mode=daily" >> $GITHUB_OUTPUT
+            else
+              echo "mode=check" >> $GITHUB_OUTPUT
+            fi
           fi
 
       - name: Run
