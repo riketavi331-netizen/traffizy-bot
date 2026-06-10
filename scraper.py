@@ -51,12 +51,30 @@ async def tg(client: httpx.AsyncClient, text: str):
 
 # ── API ───────────────────────────────────────────────────────────────────────
 
+async def api_get_with_retry(client: httpx.AsyncClient,
+                             path: str, params: list) -> httpx.Response:
+    """GET with automatic retry on 429 (wait 10s and try once more)."""
+    for attempt in range(2):
+        r = await client.get(
+            f"{BASE_URL}{path}",
+            headers=HEADERS,
+            params=params,
+            timeout=30,
+        )
+        print(f"GET {path} → {r.status_code}")
+        if r.status_code == 429 and attempt == 0:
+            print("Rate limited, waiting 10s...")
+            await asyncio.sleep(10)
+            continue
+        return r
+    return r
+
+
 async def fetch_report(client: httpx.AsyncClient,
                        d_from: str, d_to: str) -> list[dict]:
     """
     GET /api/customer/v1/casino/report
     group_by[]=brand  →  one row per brand
-    Returns list of row dicts.
     """
     params = [
         ("from",               d_from),
@@ -68,23 +86,16 @@ async def fetch_report(client: httpx.AsyncClient,
         params.append(("columns[]", col))
     params.append(("group_by[]", "brand"))
 
-    r = await client.get(
-        f"{BASE_URL}/api/customer/v1/casino/report",
-        headers=HEADERS,
-        params=params,
-        timeout=30,
-    )
-    print(f"report → {r.status_code}: {r.text[:600]}")
+    r = await api_get_with_retry(client, "/api/customer/v1/casino/report", params)
+    print(f"report body: {r.text[:600]}")
     r.raise_for_status()
 
     data = r.json()
-    # Extract rows
     if isinstance(data, list):
         return data
     rows = data.get("rows", {}).get("data", [])
     if rows:
         return rows
-    # Maybe totals only
     totals = data.get("totals", {}).get("data", [])
     return totals if totals else []
 
@@ -223,13 +234,11 @@ async def main():
     new_state: dict = {}
 
     async with httpx.AsyncClient() as client:
-        # Get brand names (best effort)
-        brand_map = await get_brand_map(client)
-        print(f"Brand map: {brand_map}")
-
-        # Get unique clicks per brand
+        # Get unique clicks per brand (best effort, skip on 429)
         unique_map = await fetch_traffic_report(client, today, today)
         print(f"Unique clicks map: {unique_map}")
+
+        await asyncio.sleep(3)
 
         try:
             rows = await fetch_report(client, today, today)
