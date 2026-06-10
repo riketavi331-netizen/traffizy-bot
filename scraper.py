@@ -1,6 +1,5 @@
 """
 Traffizy → Telegram reporter
-Uses the Customer Operator REST API (no browser scraping).
 """
 import os
 import asyncio
@@ -13,105 +12,14 @@ TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 STATISTIC_TOKEN  = os.environ["STATISTIC_TOKEN"]
 
-BASE_URL   = "https://affiliate.traffizy.partners"
+BASE_URL = "https://affiliate.traffizy.partners"
 STATE_FILE = Path("/tmp/prev_stats.json")
 
 HEADERS = {
     "Accept":        "application/json",
-    "Content-Type":  "application/json",
-    "Host":          "affiliate.traffizy.partners",
     "Authorization": STATISTIC_TOKEN,
 }
 
-
-# ── Traffizy API ──────────────────────────────────────────────────────────────
-
-async def fetch_traffic(client: httpx.AsyncClient, date_from: str, date_to: str) -> dict:
-    """
-    GET /api/customer/v1/casino/traffic_report
-    Returns visits, registrations, etc.
-    """
-    r = await client.get(
-        f"{BASE_URL}/api/customer/v1/casino/traffic_report",
-        headers=HEADERS,
-        params={"date_from": date_from, "date_to": date_to},
-        timeout=30,
-    )
-    r.raise_for_status()
-    return r.json()
-
-
-async def fetch_report(client: httpx.AsyncClient, date_from: str, date_to: str) -> dict:
-    """
-    GET /api/customer/v1/casino/report
-    Returns deposits, FTD, NGR, etc.
-    Requests specific columns to keep the response compact.
-    """
-    columns = [
-        "first_deposits_count",
-        "first_deposits_sum",
-        "deposits_count",
-        "deposits_sum",
-        "cashouts_count",
-        "cashouts_sum",
-        "depositing_players_count",
-        "ngr",
-        "ggr",
-    ]
-    r = await client.get(
-        f"{BASE_URL}/api/customer/v1/casino/report",
-        headers=HEADERS,
-        params={
-            "date_from": date_from,
-            "date_to":   date_to,
-            "columns[]": columns,
-        },
-        timeout=30,
-    )
-    r.raise_for_status()
-    return r.json()
-
-
-def yesterday_range() -> tuple[str, str]:
-    d = (date.today() - timedelta(days=1)).isoformat()
-    return d, d
-
-
-def today_range() -> tuple[str, str]:
-    d = date.today().isoformat()
-    return d, d
-
-
-# ── Merge API responses into one flat dict ────────────────────────────────────
-
-def flatten(traffic: dict, report: dict) -> dict:
-    stats: dict = {}
-
-    # Traffic report — could be list of rows or a totals dict; grab totals
-    t = traffic if isinstance(traffic, dict) else {}
-    if isinstance(traffic, list) and traffic:
-        # Sum across all rows if grouped
-        for row in traffic:
-            for k, v in row.items():
-                if isinstance(v, (int, float)):
-                    stats[k] = stats.get(k, 0) + v
-    else:
-        stats.update({k: v for k, v in t.items() if isinstance(v, (int, float))})
-
-    # Casino report — same logic
-    rr = report if isinstance(report, dict) else {}
-    if isinstance(report, list) and report:
-        for row in report:
-            for k, v in row.items():
-                if isinstance(v, (int, float)):
-                    stats[k] = stats.get(k, 0) + v
-    else:
-        stats.update({k: v for k, v in rr.items() if isinstance(v, (int, float))})
-
-    return stats
-
-
-# ── Telegram ──────────────────────────────────────────────────────────────────
 
 async def tg_send(client: httpx.AsyncClient, text: str):
     await client.post(
@@ -121,104 +29,154 @@ async def tg_send(client: httpx.AsyncClient, text: str):
     )
 
 
-# ── Change detection ──────────────────────────────────────────────────────────
-
-ALERT_KEYS  = ("visits", "registrations", "first_deposits_count", "deposits_sum")
-ALERT_THRESHOLD = 0.30  # 30 %
-
-
-def load_prev() -> dict:
-    return json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
-
-
-def save_prev(stats: dict):
-    STATE_FILE.write_text(json.dumps(stats))
+async def try_get(client: httpx.AsyncClient, url: str, params: dict) -> tuple[int, str]:
+    """Returns (status_code, response_text)."""
+    try:
+        r = await client.get(url, headers=HEADERS, params=params, timeout=30)
+        print(f"GET {url} {params} → {r.status_code}: {r.text[:300]}")
+        return r.status_code, r.text
+    except Exception as e:
+        print(f"GET {url} → Exception: {e}")
+        return 0, str(e)
 
 
-def build_alert(prev: dict, curr: dict) -> str | None:
-    lines = []
-    for key in ALERT_KEYS:
-        old = prev.get(key)
-        new = curr.get(key)
-        if old is None or new is None or old == 0:
-            continue
-        delta = (new - old) / old
-        if abs(delta) >= ALERT_THRESHOLD:
-            arrow = "📈" if delta > 0 else "📉"
-            lines.append(f"{arrow} <b>{key}</b>: {old:,.0f} → {new:,.0f} ({delta:+.0%})")
-    return "\n".join(lines) if lines else None
+async def fetch_data(client: httpx.AsyncClient, date_from: str, date_to: str) -> dict | list | None:
+    """
+    Tries multiple parameter combinations to get traffic/report data.
+    Returns the first successful JSON response.
+    """
+    base = f"{BASE_URL}/api/customer/v1/casino/traffic_report"
+
+    attempts = [
+        {"date_from": date_from, "date_to": date_to, "group_by": "total"},
+        {"date_from": date_from, "date_to": date_to, "group_by": "day"},
+        {"date_from": date_from, "date_to": date_to},
+        {"from": date_from, "to": date_to},
+        {"start_date": date_from, "end_date": date_to},
+    ]
+
+    for params in attempts:
+        status, body = await try_get(client, base, params)
+        if status == 200:
+            try:
+                return json.loads(body)
+            except Exception:
+                pass
+
+    # Also try casino/report endpoint
+    report_base = f"{BASE_URL}/api/customer/v1/casino/report"
+    for params in attempts:
+        status, body = await try_get(client, report_base, params)
+        if status == 200:
+            try:
+                return json.loads(body)
+            except Exception:
+                pass
+
+    return None
 
 
-# ── Message formatting ────────────────────────────────────────────────────────
+async def fetch_filters(client: httpx.AsyncClient) -> str:
+    """Fetches available filters to understand required params."""
+    status, body = await try_get(
+        client,
+        f"{BASE_URL}/api/customer/v1/casino/traffic_report/filters",
+        {}
+    )
+    return body[:800] if status == 200 else f"filters: {status}"
+
+
+def flatten(data: dict | list) -> dict:
+    stats: dict = {}
+    rows = data if isinstance(data, list) else [data]
+    for row in rows:
+        if isinstance(row, dict):
+            for k, v in row.items():
+                if isinstance(v, (int, float)):
+                    stats[k] = stats.get(k, 0) + v
+    return stats
+
+
+def yesterday() -> str:
+    return (date.today() - timedelta(days=1)).isoformat()
+
+def today() -> str:
+    return date.today().isoformat()
+
 
 LABELS = {
     "visits":                  ("👆", "Visits"),
     "registrations":           ("📝", "Registrations"),
     "depositing_players_count":("👤", "Depositors"),
     "first_deposits_count":    ("🆕", "FTD count"),
-    "first_deposits_sum":      ("💵", "FTD sum (USD)"),
-    "deposits_count":          ("💳", "Deposits count"),
-    "deposits_sum":            ("💰", "Deposits sum (USD)"),
-    "cashouts_count":          ("🔄", "Cashouts count"),
-    "cashouts_sum":            ("🔄", "Cashouts sum (USD)"),
-    "ngr":                     ("📊", "NGR (USD)"),
-    "ggr":                     ("📊", "GGR (USD)"),
+    "first_deposits_sum":      ("💵", "FTD sum"),
+    "deposits_count":          ("💳", "Deposits"),
+    "deposits_sum":            ("💰", "Deposits sum"),
+    "cashouts_count":          ("🔄", "Cashouts"),
+    "ngr":                     ("📊", "NGR"),
 }
+MONEY = {"first_deposits_sum", "deposits_sum", "ngr", "ggr"}
 
 
-def fmt_val(v: float, key: str) -> str:
-    money_keys = {"first_deposits_sum", "deposits_sum", "cashouts_sum", "ngr", "ggr"}
-    if key in money_keys:
-        return f"${v:,.2f}"
-    return f"{v:,.0f}"
-
-
-def format_daily(stats: dict, period_label: str) -> str:
-    lines = [f"📊 <b>Traffizy — {period_label}</b>", ""]
+def format_stats(stats: dict, label: str) -> str:
+    lines = [f"📊 <b>Traffizy — {label}</b>", ""]
     found = False
-    for key, (emoji, label) in LABELS.items():
+    for key, (emoji, name) in LABELS.items():
         val = stats.get(key)
         if val is not None:
-            lines.append(f"{emoji} <b>{label}</b>: {fmt_val(val, key)}")
+            v = f"${val:,.2f}" if key in MONEY else f"{val:,.0f}"
+            lines.append(f"{emoji} <b>{name}</b>: {v}")
             found = True
     if not found:
-        lines.append("⚠️ Нет данных за период")
+        lines.append("⚠️ Нет распознанных данных")
     return "\n".join(lines)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+def load_prev() -> dict:
+    return json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
+
+def save_prev(stats: dict):
+    STATE_FILE.write_text(json.dumps(stats))
+
 
 async def main():
-    mode = os.environ.get("RUN_MODE", "daily")  # daily | check
+    mode = os.environ.get("RUN_MODE", "daily")
+    d_from = yesterday() if mode == "daily" else today()
+    d_to   = d_from
+    label  = f"вчера ({d_from})" if mode == "daily" else f"сегодня ({d_from})"
 
     async with httpx.AsyncClient() as client:
-        try:
-            if mode == "daily":
-                date_from, date_to = yesterday_range()
-                label = f"вчера ({date_from})"
-            else:
-                date_from, date_to = today_range()
-                label = f"сегодня ({date_from})"
+        # Diagnostic: fetch filters first
+        filters_info = await fetch_filters(client)
+        print(f"FILTERS: {filters_info}")
 
-            traffic = await fetch_traffic(client, date_from, date_to)
-            report  = await fetch_report(client, date_from, date_to)
-            stats   = flatten(traffic, report)
+        data = await fetch_data(client, d_from, d_to)
 
-        except httpx.HTTPStatusError as e:
-            await tg_send(client, f"❌ <b>Traffizy API error {e.response.status_code}</b>\n<code>{e.response.text[:300]}</code>")
-            raise
-        except Exception as e:
-            await tg_send(client, f"❌ <b>Ошибка</b>\n<code>{e}</code>")
-            raise
+        if data is None:
+            # Send diagnostic to Telegram
+            await tg_send(client,
+                f"❌ <b>Все попытки API вернули ошибку</b>\n\n"
+                f"<b>Filters endpoint:</b>\n<code>{filters_info[:400]}</code>"
+            )
+            return
+
+        stats = flatten(data)
+        print(f"STATS: {stats}")
 
         if mode == "daily":
-            await tg_send(client, format_daily(stats, label))
-
+            await tg_send(client, format_stats(stats, label))
         elif mode == "check":
             prev  = load_prev()
-            alert = build_alert(prev, stats)
-            if alert:
-                await tg_send(client, f"⚡️ <b>Traffizy — изменение</b>\n\n{alert}")
+            alert_lines = []
+            for key in ("visits", "registrations", "first_deposits_count"):
+                old, new = prev.get(key), stats.get(key)
+                if old and new and old != 0:
+                    delta = (new - old) / old
+                    if abs(delta) >= 0.30:
+                        arrow = "📈" if delta > 0 else "📉"
+                        alert_lines.append(f"{arrow} <b>{key}</b>: {old:,.0f}→{new:,.0f} ({delta:+.0%})")
+            if alert_lines:
+                await tg_send(client, "⚡️ <b>Traffizy — изменение</b>\n\n" + "\n".join(alert_lines))
 
         save_prev(stats)
 
