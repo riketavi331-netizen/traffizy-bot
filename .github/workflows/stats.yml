@@ -2,18 +2,9 @@ name: Traffizy → Telegram
 
 on:
   schedule:
-    - cron: "0 6 * * *"
-    - cron: "0 0,12,18 * * *"
-  workflow_dispatch:
-    inputs:
-      mode:
-        description: 'Режим запуска'
-        required: false
-        default: 'daily'
-        type: choice
-        options:
-          - daily
-          - check
+    # Каждый час
+    - cron: "0 * * * *"
+  workflow_dispatch:   # ручной запуск для теста
 
 jobs:
   send-stats:
@@ -31,24 +22,26 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Determine run mode
-        id: mode
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "mode=${{ inputs.mode }}" >> $GITHUB_OUTPUT
-          else
-            HOUR=$(date -u +%H)
-            if [ "$HOUR" = "06" ]; then
-              echo "mode=daily" >> $GITHUB_OUTPUT
-            else
-              echo "mode=check" >> $GITHUB_OUTPUT
-            fi
-          fi
+      # Восстанавливаем state.json между запусками (нужен для алертов)
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: traffizy-state-${{ github.run_id }}
+          restore-keys: |
+            traffizy-state-
 
       - name: Run
         env:
           TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           STATISTIC_TOKEN:  ${{ secrets.STATISTIC_TOKEN }}
-          RUN_MODE:         ${{ steps.mode.outputs.mode }}
         run: python scraper.py
+
+      # Сохраняем state.json для следующего запуска
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: traffizy-state-${{ github.run_id }}
