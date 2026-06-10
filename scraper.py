@@ -88,27 +88,46 @@ async def fetch_report(client: httpx.AsyncClient,
     return totals if totals else []
 
 
+# ── Parse row format ─────────────────────────────────────────────────────────
+# API returns rows as list of {name, value, type} objects, not plain dicts.
+# Money values: {"currency":"USD","amount":"55.31","amount_cents":"5531.0"}
+
+def parse_row(row: list) -> dict:
+    """Convert [{name, value, type}, ...] → flat dict with numeric values."""
+    out = {}
+    for item in row:
+        key = item["name"]
+        val = item["value"]
+        if isinstance(val, dict) and "amount" in val:
+            try:
+                out[key] = float(val["amount"])
+            except (ValueError, TypeError):
+                out[key] = 0.0
+        elif isinstance(val, (int, float)):
+            out[key] = val
+        elif isinstance(val, str):
+            out[key] = val
+    return out
+
+
 # ── Metrics ───────────────────────────────────────────────────────────────────
 
-def row_to_metrics(row: dict) -> dict:
-    clicks  = row.get("visits_count") or row.get("visits") or 0
-    unique  = row.get("unique_visits_count") or row.get("unique_visits") or 0
-    regs    = row.get("registrations_count") or row.get("registrations") or 0
-    ftd     = row.get("first_deposits_count") or row.get("ftd_count") or 0
+def row_to_metrics(d: dict) -> dict:
+    clicks = d.get("visits_count") or 0
+    unique = d.get("unique_visits_count") or 0
+    regs   = d.get("registrations_count") or 0
+    ftd    = d.get("first_deposits_count") or 0
     c2r = round(regs / clicks * 100, 2) if clicks else 0.0
     r2d = round(ftd  / regs  * 100, 2) if regs  else 0.0
     return {"clicks": clicks, "unique": unique, "regs": regs,
             "ftd": ftd, "c2r": c2r, "r2d": r2d}
 
 
-def brand_name(row: dict) -> str:
-    """Extract brand name from a grouped row."""
-    for key in ("brand_name", "brand", "name", "title"):
-        if isinstance(row.get(key), str) and row[key]:
-            return row[key]
-    if isinstance(row.get("brand"), dict):
-        return row["brand"].get("name", "Unknown")
-    return "All brands"
+def brand_name(d: dict, brand_map: dict) -> str:
+    bid = d.get("brand_id")
+    if bid and bid in brand_map:
+        return brand_map[bid]
+    return f"Brand {bid}" if bid else "Traffizy"
 
 
 # ── Format ────────────────────────────────────────────────────────────────────
@@ -139,6 +158,22 @@ def save_state(s: dict):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+async def get_brand_map(client: httpx.AsyncClient) -> dict:
+    """Returns {brand_id: brand_name} mapping."""
+    try:
+        r = await client.get(
+            f"{BASE_URL}/api/client/partner/brands",
+            headers=HEADERS, timeout=30,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            items = data if isinstance(data, list) else data.get("data", [])
+            return {b["id"]: b["name"] for b in items if "id" in b and "name" in b}
+    except Exception as e:
+        print(f"brand_map error: {e}")
+    return {}
+
+
 async def main():
     now_msk = datetime.now(timezone.utc) + timedelta(hours=3)
     label   = f"сегодня ({now_msk.strftime('%d.%m, %H:%M')} МСК)"
@@ -148,6 +183,10 @@ async def main():
     new_state: dict = {}
 
     async with httpx.AsyncClient() as client:
+        # Get brand names (best effort)
+        brand_map = await get_brand_map(client)
+        print(f"Brand map: {brand_map}")
+
         try:
             rows = await fetch_report(client, today, today)
         except httpx.HTTPStatusError as e:
@@ -157,18 +196,19 @@ async def main():
             return
 
         print(f"Rows received: {len(rows)}")
-        for row in rows:
-            print(f"  row: {row}")
 
         if not rows:
             await tg(client, f"📊 <b>Traffizy — {label}</b>\n\n<i>Нет данных за сегодня</i>")
             return
 
         for row in rows:
-            name = brand_name(row)
-            m    = row_to_metrics(row)
-            key  = name.lower().replace(" ", "_")
+            # Row is a list of {name, value, type} — convert to dict first
+            d    = parse_row(row) if isinstance(row, list) else row
+            name = brand_name(d, brand_map)
+            m    = row_to_metrics(d)
+            key  = str(d.get("brand_id", name))
 
+            print(f"{name}: {m}")
             await tg(client, fmt_report(m, name, label))
 
             # Conversion alert
@@ -180,8 +220,7 @@ async def main():
                     if prev.get(metric, 0) > 0 and drop >= ALERT_DROP_PP:
                         alerts.append(
                             f"📉 <b>{lbl}</b>: {prev[metric]:.1f}% → "
-                            f"{m[metric]:.1f}% (−{drop:.1f}pp)"
-                        )
+                            f"{m[metric]:.1f}% (−{drop:.1f}pp)")
                 if alerts:
                     await tg(client,
                         f"⚠️ <b>{name} — падение конверсии!</b>\n\n"
