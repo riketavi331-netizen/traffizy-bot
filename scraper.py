@@ -1,7 +1,5 @@
 """
-Traffizy → Telegram  |  Frontend Partner API
-- Hourly stats per brand (Sikkaro, Orowin, + new ones automatically)
-- Conversion alert when C2R or R2D drops ≥ 3 percentage points
+Traffizy → Telegram  |  Customer Operator API + STATISTIC_TOKEN
 """
 import os
 import asyncio
@@ -10,24 +8,31 @@ from pathlib import Path
 from datetime import date, datetime, timedelta, timezone
 import httpx
 
-EMAIL            = os.environ.get("TRAFFIZY_EMAIL", "")
-PASSWORD         = os.environ.get("TRAFFIZY_PASSWORD", "")
-OTP_SECRET       = os.environ.get("TRAFFIZY_OTP_SECRET", "")
-STATISTIC_TOKEN  = os.environ.get("STATISTIC_TOKEN", "")
-TG_TOKEN = os.environ["TELEGRAM_TOKEN"]
-TG_CHAT  = os.environ["TELEGRAM_CHAT_ID"]
+STATISTIC_TOKEN = os.environ["STATISTIC_TOKEN"]
+TG_TOKEN        = os.environ["TELEGRAM_TOKEN"]
+TG_CHAT         = os.environ["TELEGRAM_CHAT_ID"]
 
 HOST     = "affiliate.traffizy.partners"
 BASE_URL = f"https://{HOST}"
 STATE_FILE = Path("state.json")
-
 ALERT_DROP_PP = 3.0
 
 HEADERS = {
-    "Accept":       "application/json",
-    "Content-Type": "application/json",
-    "Host":         HOST,
+    "Accept":        "application/json",
+    "Host":          HOST,
+    "Authorization": STATISTIC_TOKEN,
 }
+
+# Колонки для /casino/report
+REPORT_COLS = [
+    "first_deposits_count",
+    "first_deposits_sum",
+    "deposits_count",
+    "deposits_sum",
+    "cashouts_count",
+    "depositing_players_count",
+    "ngr",
+]
 
 
 async def tg(client: httpx.AsyncClient, text: str):
@@ -38,68 +43,63 @@ async def tg(client: httpx.AsyncClient, text: str):
     )
 
 
-async def sign_in(client: httpx.AsyncClient) -> None:
-    if STATISTIC_TOKEN:
-        r = await client.get(
-            f"{BASE_URL}/api/client/partner/brands",
-            headers={**HEADERS, "Authorization": STATISTIC_TOKEN},
-            timeout=30,
-        )
-        print(f"token-auth test → {r.status_code}")
-        if r.status_code == 200:
-            client.headers.update({"Authorization": STATISTIC_TOKEN})
-            return
+# ── API ───────────────────────────────────────────────────────────────────────
 
-    otp = None
-    if OTP_SECRET:
-        import pyotp
-        otp = pyotp.TOTP(OTP_SECRET).now()
-
-    r = await client.post(
-        f"{BASE_URL}/api/client/partner/sign_in",
+async def api_get(client: httpx.AsyncClient, path: str, params: dict) -> dict:
+    r = await client.get(
+        f"{BASE_URL}{path}",
         headers=HEADERS,
-        json={"partner_user": {"email": EMAIL, "password": PASSWORD,
-                               "otp_attempt": otp}},
+        params=params,
         timeout=30,
     )
-    print(f"sign_in → {r.status_code}: {r.text[:200]}")
+    print(f"GET {path} {params} → {r.status_code}: {r.text[:400]}")
     r.raise_for_status()
+    return r.json()
 
 
 async def get_brands(client: httpx.AsyncClient) -> list[dict]:
-    r = await client.get(
-        f"{BASE_URL}/api/client/partner/brands",
-        headers=HEADERS,
-        timeout=30,
-    )
-    print(f"brands → {r.status_code}: {r.text[:200]}")
-    r.raise_for_status()
-    data = r.json()
-    if isinstance(data, list):
-        return [{"id": b["id"], "name": b["name"]} for b in data]
-    if isinstance(data, dict):
-        items = data.get("data") or data.get("brands") or []
-        return [{"id": b["id"], "name": b["name"]} for b in items]
+    """Fetch brand list. Tries both Customer Operator and Partner endpoints."""
+    for path in ["/api/customer/v1/casino/brands",
+                 "/api/client/partner/brands"]:
+        try:
+            data = await api_get(client, path, {})
+            items = data if isinstance(data, list) else (
+                data.get("data") or data.get("brands") or []
+            )
+            if items:
+                return [{"id": b["id"], "name": b["name"]} for b in items]
+        except Exception as e:
+            print(f"{path} failed: {e}")
     return []
 
 
-async def fetch_traffic(client: httpx.AsyncClient, d_from: str, d_to: str, brand_id: int) -> dict:
-    params = {"from": d_from, "to": d_to, "brand_id": brand_id}
-    r = await client.get(f"{BASE_URL}/api/client/partner/traffic_report",
-                         headers=HEADERS, params=params, timeout=30)
-    print(f"traffic brand={brand_id} → {r.status_code}: {r.text[:300]}")
-    r.raise_for_status()
-    return r.json()
+async def fetch_traffic(client: httpx.AsyncClient,
+                        d_from: str, d_to: str,
+                        brand_id: int | None = None) -> dict:
+    params: dict = {"from": d_from, "to": d_to, "group_by": "total"}
+    if brand_id:
+        params["brand_id"] = brand_id
+    return await api_get(client, "/api/customer/v1/casino/traffic_report", params)
 
 
-async def fetch_report(client: httpx.AsyncClient, d_from: str, d_to: str, brand_id: int) -> dict:
-    params = {"from": d_from, "to": d_to, "brand_id": brand_id}
-    r = await client.get(f"{BASE_URL}/api/client/partner/report",
-                         headers=HEADERS, params=params, timeout=30)
-    print(f"report brand={brand_id} → {r.status_code}: {r.text[:300]}")
-    r.raise_for_status()
-    return r.json()
+async def fetch_report(client: httpx.AsyncClient,
+                       d_from: str, d_to: str,
+                       brand_id: int | None = None) -> dict:
+    params: dict = {
+        "from": d_from,
+        "to":   d_to,
+        "group_by": "total",
+    }
+    for col in REPORT_COLS:
+        params.setdefault("columns[]", [])
+    # httpx handles list params correctly
+    params["columns[]"] = REPORT_COLS
+    if brand_id:
+        params["brand_id"] = brand_id
+    return await api_get(client, "/api/customer/v1/casino/report", params)
 
+
+# ── Parse ─────────────────────────────────────────────────────────────────────
 
 def parse_totals(resp) -> dict:
     out: dict = {}
@@ -112,10 +112,7 @@ def parse_totals(resp) -> dict:
         return out
     td = resp.get("totals", {}).get("data", [])
     if td and isinstance(td[0], dict):
-        for k, v in td[0].items():
-            if isinstance(v, (int, float)):
-                out[k] = v
-        return out
+        return {k: v for k, v in td[0].items() if isinstance(v, (int, float))}
     for row in resp.get("rows", {}).get("data", []):
         if isinstance(row, dict):
             for k, v in row.items():
@@ -126,17 +123,20 @@ def parse_totals(resp) -> dict:
 
 def calc(traffic: dict, report: dict) -> dict:
     raw = {**traffic, **report}
-    clicks = raw.get("visits") or raw.get("clicks") or raw.get("all_clicks") or raw.get("click_count") or 0
+    clicks = raw.get("visits") or raw.get("clicks") or raw.get("click_count") or 0
     unique = raw.get("unique_visits") or raw.get("unique_clicks") or raw.get("uniq_clicks") or 0
-    regs   = raw.get("registrations") or raw.get("reg_count") or raw.get("registration_count") or 0
+    regs   = raw.get("registrations") or raw.get("reg_count") or 0
     ftd    = raw.get("first_deposits_count") or raw.get("ftd_count") or raw.get("ftd") or 0
     c2r = round(regs / clicks * 100, 2) if clicks else 0.0
     r2d = round(ftd  / regs  * 100, 2) if regs  else 0.0
-    return {"clicks": clicks, "unique": unique, "regs": regs, "ftd": ftd, "c2r": c2r, "r2d": r2d}
+    return {"clicks": clicks, "unique": unique, "regs": regs,
+            "ftd": ftd, "c2r": c2r, "r2d": r2d}
 
 
-def fmt_report(m: dict, brand_name: str, label: str) -> str:
-    lines = [f"📊 <b>{brand_name} — {label}</b>", ""]
+# ── Format ────────────────────────────────────────────────────────────────────
+
+def fmt_report(m: dict, name: str, label: str) -> str:
+    lines = [f"📊 <b>{name} — {label}</b>", ""]
     lines.append(f"👆 All clicks: <b>{m['clicks']:,}</b>")
     if m["unique"]:
         lines.append(f"🎯 Unique clicks: <b>{m['unique']:,}</b>")
@@ -150,68 +150,84 @@ def fmt_report(m: dict, brand_name: str, label: str) -> str:
     return "\n".join(lines)
 
 
+# ── State ─────────────────────────────────────────────────────────────────────
+
 def load_state() -> dict:
     return json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
 
-def save_state(state: dict):
-    STATE_FILE.write_text(json.dumps(state))
+def save_state(s: dict):
+    STATE_FILE.write_text(json.dumps(s))
 
+
+# ── Per brand ─────────────────────────────────────────────────────────────────
 
 async def process_brand(client, brand, d_from, d_to, label, prev_state) -> dict:
     bid, name = brand["id"], brand["name"]
-    traffic_raw, report_raw = {}, {}
+    t_raw, r_raw = {}, {}
+
     try:
-        traffic_raw = parse_totals(await fetch_traffic(client, d_from, d_to, bid))
+        t_raw = parse_totals(await fetch_traffic(client, d_from, d_to, bid))
     except httpx.HTTPStatusError as e:
-        print(f"traffic error for {name}: {e.response.status_code}")
-    await asyncio.sleep(1)
+        print(f"traffic error {name}: {e.response.status_code}")
+
+    await asyncio.sleep(2)
+
     try:
-        report_raw = parse_totals(await fetch_report(client, d_from, d_to, bid))
+        r_raw = parse_totals(await fetch_report(client, d_from, d_to, bid))
     except httpx.HTTPStatusError as e:
-        print(f"report error for {name}: {e.response.status_code}")
-    m = calc(traffic_raw, report_raw)
-    print(f"{name} metrics: {m}")
+        print(f"report error {name}: {e.response.status_code}")
+
+    m = calc(t_raw, r_raw)
+    print(f"{name}: {m}")
     await tg(client, fmt_report(m, name, label))
+
     prev = prev_state.get(str(bid), {})
     if prev:
         alerts = []
         for key, lbl in (("c2r", "C2R"), ("r2d", "R2D")):
-            old, new = prev.get(key, 0), m.get(key, 0)
-            drop = old - new
-            if old > 0 and drop >= ALERT_DROP_PP:
-                alerts.append(f"📉 <b>{lbl}</b>: {old:.1f}% → {new:.1f}% (−{drop:.1f}pp)")
+            drop = prev.get(key, 0) - m.get(key, 0)
+            if prev.get(key, 0) > 0 and drop >= ALERT_DROP_PP:
+                alerts.append(
+                    f"📉 <b>{lbl}</b>: {prev[key]:.1f}% → {m[key]:.1f}% (−{drop:.1f}pp)")
         if alerts:
             await tg(client, f"⚠️ <b>{name} — падение конверсии!</b>\n\n" + "\n".join(alerts))
     return m
 
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 async def main():
     now_msk = datetime.now(timezone.utc) + timedelta(hours=3)
     label   = f"сегодня ({now_msk.strftime('%d.%m, %H:%M')} МСК)"
     today   = date.today().isoformat()
     d_from  = (date.today() - timedelta(days=1)).isoformat()
+
     prev_state = load_state()
     new_state: dict = {}
+
     async with httpx.AsyncClient() as client:
-        try:
-            await sign_in(client)
-        except httpx.HTTPStatusError as e:
-            await tg(client, f"❌ <b>Ошибка входа в Traffizy</b>\n<code>{e.response.text[:200]}</code>")
-            return
-        try:
-            brands = await get_brands(client)
-        except httpx.HTTPStatusError as e:
-            await tg(client, f"❌ <b>Ошибка получения брендов</b>\n<code>{e.response.text[:200]}</code>")
-            return
-        print(f"Brands: {brands}")
+        # Try to get brand list
+        brands = await get_brands(client)
+        print(f"Brands found: {brands}")
+
         if not brands:
-            await tg(client, "⚠️ Нет доступных брендов в аккаунте")
-            return
-        for brand in brands:
+            # No brand list → send single combined report
+            await asyncio.sleep(1)
+            t_raw = parse_totals(await fetch_traffic(client, d_from, today))
             await asyncio.sleep(2)
-            m = await process_brand(client, brand, d_from, today, label, prev_state)
-            new_state[str(brand["id"])] = m
+            r_raw = parse_totals(await fetch_report(client, d_from, today))
+            m = calc(t_raw, r_raw)
+            await tg(client, fmt_report(m, "Traffizy", label))
+            new_state["all"] = m
+        else:
+            for brand in brands:
+                await asyncio.sleep(2)
+                m = await process_brand(client, brand, d_from, today,
+                                        label, prev_state)
+                new_state[str(brand["id"])] = m
+
     save_state(new_state)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
