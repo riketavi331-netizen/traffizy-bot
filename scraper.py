@@ -1,12 +1,11 @@
 """
-Traffizy → Telegram reporter
-API: /api/customer/v1/casino/report  params: from, to
+Traffizy → Telegram  |  hourly stats + conversion alerts
 """
 import os
 import asyncio
 import json
 from pathlib import Path
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 import httpx
 
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
@@ -14,30 +13,20 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 STATISTIC_TOKEN  = os.environ["STATISTIC_TOKEN"]
 
 BASE_URL   = "https://affiliate.traffizy.partners"
-STATE_FILE = Path("/tmp/prev_stats.json")
+STATE_FILE = Path("state.json")   # кешируется между запусками в GitHub Actions
 
 HEADERS = {
     "Accept":        "application/json",
     "Authorization": STATISTIC_TOKEN,
 }
 
-MONEY_KEYS = {"first_deposits_sum", "deposits_sum", "cashouts_sum", "ngr", "ggr", "real_ngr", "real_ggr"}
-
-LABELS = {
-    "visits":                  ("👆", "Visits"),
-    "registrations":           ("📝", "Registrations"),
-    "depositing_players_count":("👤", "Depositors"),
-    "first_deposits_count":    ("🆕", "FTD count"),
-    "first_deposits_sum":      ("💵", "FTD sum"),
-    "deposits_count":          ("💳", "Deposits count"),
-    "deposits_sum":            ("💰", "Deposits sum"),
-    "cashouts_count":          ("🔄", "Cashouts"),
-    "ngr":                     ("📊", "NGR"),
-    "ggr":                     ("📈", "GGR"),
-}
+# Порог алерта: падение конверсии на X процентных пунктов
+ALERT_THRESHOLD_PP = 3.0
 
 
-async def tg_send(client: httpx.AsyncClient, text: str):
+# ── Telegram ──────────────────────────────────────────────────────────────────
+
+async def tg(client: httpx.AsyncClient, text: str):
     await client.post(
         f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
         json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
@@ -45,122 +34,167 @@ async def tg_send(client: httpx.AsyncClient, text: str):
     )
 
 
-async def fetch_report(client: httpx.AsyncClient, d_from: str, d_to: str) -> dict:
-    """Fetch /casino/report totals for the given date range."""
-    url = f"{BASE_URL}/api/customer/v1/casino/report"
-    params = {"from": d_from, "to": d_to}
-    r = await client.get(url, headers=HEADERS, params=params, timeout=30)
-    print(f"report → {r.status_code}: {r.text[:400]}")
+# ── API calls ─────────────────────────────────────────────────────────────────
+
+async def get(client: httpx.AsyncClient, path: str, params: dict) -> dict:
+    r = await client.get(
+        f"{BASE_URL}{path}",
+        headers=HEADERS,
+        params=params,
+        timeout=30,
+    )
+    print(f"GET {path} {params} → {r.status_code}: {r.text[:300]}")
     r.raise_for_status()
     return r.json()
 
 
-async def fetch_traffic(client: httpx.AsyncClient, d_from: str, d_to: str) -> dict:
-    """Fetch /casino/traffic_report totals for the given date range."""
-    url = f"{BASE_URL}/api/customer/v1/casino/traffic_report"
-    params = {"from": d_from, "to": d_to}
-    r = await client.get(url, headers=HEADERS, params=params, timeout=30)
-    print(f"traffic → {r.status_code}: {r.text[:400]}")
-    r.raise_for_status()
-    return r.json()
-
-
-def extract_totals(response: dict) -> dict:
-    """
-    API response structure:
-      {"totals": {"data": [{"visits": 49, ...}]}, "rows": {"data": [...]}, ...}
-    Returns flattened numeric dict from totals.data[0] if available,
-    otherwise sums rows.data.
-    """
+def parse_totals(resp: dict) -> dict:
+    """Extract numeric totals from API response."""
     stats: dict = {}
-
-    totals_data = response.get("totals", {}).get("data", [])
-    if totals_data and isinstance(totals_data[0], dict):
-        for k, v in totals_data[0].items():
+    # Try totals.data[0] first
+    td = resp.get("totals", {}).get("data", [])
+    if td and isinstance(td[0], dict):
+        for k, v in td[0].items():
             if isinstance(v, (int, float)):
                 stats[k] = v
         return stats
-
-    # Fallback: sum rows
-    for row in response.get("rows", {}).get("data", []):
+    # Fallback: sum rows.data
+    for row in resp.get("rows", {}).get("data", []):
         if isinstance(row, dict):
             for k, v in row.items():
                 if isinstance(v, (int, float)):
                     stats[k] = stats.get(k, 0) + v
+    return stats
+
+
+async def fetch_stats(client: httpx.AsyncClient, d_from: str, d_to: str) -> dict:
+    stats: dict = {}
+
+    # traffic_report → clicks, unique clicks, registrations
+    try:
+        data = await get(client, "/api/customer/v1/casino/traffic_report",
+                         {"from": d_from, "to": d_to})
+        stats.update(parse_totals(data))
+    except httpx.HTTPStatusError as e:
+        print(f"traffic_report error {e.response.status_code}")
+
+    await asyncio.sleep(2)  # avoid rate limiting
+
+    # casino/report → FTDs
+    try:
+        data = await get(client, "/api/customer/v1/casino/report",
+                         {"from": d_from, "to": d_to})
+        stats.update(parse_totals(data))
+    except httpx.HTTPStatusError as e:
+        print(f"report error {e.response.status_code}")
 
     return stats
 
 
-def format_stats(stats: dict, label: str) -> str:
+# ── Metrics calculation ───────────────────────────────────────────────────────
+
+def calc_metrics(stats: dict) -> dict:
+    """
+    Build the final metrics dict including calculated conversion rates.
+    Field name mapping covers common variants returned by Traffizy.
+    """
+    clicks      = (stats.get("visits") or stats.get("clicks") or
+                   stats.get("all_clicks") or 0)
+    unique      = (stats.get("unique_visits") or stats.get("unique_clicks") or
+                   stats.get("uniq_clicks") or 0)
+    regs        = (stats.get("registrations") or stats.get("reg_count") or 0)
+    ftd         = (stats.get("first_deposits_count") or stats.get("ftd_count") or
+                   stats.get("ftd") or 0)
+
+    c2r = round(regs / clicks * 100, 2) if clicks else 0.0
+    r2d = round(ftd  / regs  * 100, 2) if regs  else 0.0
+
+    return {
+        "clicks":  clicks,
+        "unique":  unique,
+        "regs":    regs,
+        "ftd":     ftd,
+        "c2r":     c2r,
+        "r2d":     r2d,
+        "_raw":    stats,   # сохраняем raw для отладки
+    }
+
+
+# ── Formatting ────────────────────────────────────────────────────────────────
+
+def fmt_report(m: dict, label: str) -> str:
     lines = [f"📊 <b>Traffizy — {label}</b>", ""]
-    found = False
-    for key, (emoji, name) in LABELS.items():
-        val = stats.get(key)
-        if val is not None:
-            v = f"${val:,.2f}" if key in MONEY_KEYS else f"{val:,.0f}"
-            lines.append(f"{emoji} <b>{name}</b>: {v}")
-            found = True
-    if not found:
-        lines.append("⚠️ Нет данных за период — возможно данные за вчера ещё не готовы")
+    lines.append(f"👆 All clicks: <b>{m['clicks']:,}</b>")
+    if m["unique"]:
+        lines.append(f"🎯 Unique clicks: <b>{m['unique']:,}</b>")
+    lines.append(f"📝 Registrations: <b>{m['regs']:,}</b>")
+    lines.append(f"🆕 FTDs: <b>{m['ftd']:,}</b>")
+    lines.append("──────────────")
+    lines.append(f"C2R: <b>{m['c2r']:.1f}%</b>  (click→reg)")
+    lines.append(f"R2D: <b>{m['r2d']:.1f}%</b>  (reg→FTD)")
+    if not m["clicks"] and not m["regs"]:
+        lines.append("\n<i>Нет данных за период</i>")
     return "\n".join(lines)
 
 
-def load_prev() -> dict:
-    return json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
+def check_alerts(prev: dict, curr: dict) -> str | None:
+    lines = []
+    for key, label in (("c2r", "C2R"), ("r2d", "R2D")):
+        old = prev.get(key, 0)
+        new = curr.get(key, 0)
+        drop = old - new
+        if old > 0 and drop >= ALERT_THRESHOLD_PP:
+            lines.append(
+                f"📉 <b>{label}</b>: {old:.1f}% → {new:.1f}% "
+                f"(<b>−{drop:.1f}pp</b>)"
+            )
+    return "\n".join(lines) if lines else None
 
-def save_prev(stats: dict):
-    STATE_FILE.write_text(json.dumps(stats))
 
+# ── State ─────────────────────────────────────────────────────────────────────
+
+def load_state() -> dict:
+    if STATE_FILE.exists():
+        return json.loads(STATE_FILE.read_text())
+    return {}
+
+def save_state(m: dict):
+    # Don't save raw API dump to state
+    to_save = {k: v for k, v in m.items() if k != "_raw"}
+    STATE_FILE.write_text(json.dumps(to_save))
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 async def main():
-    mode  = os.environ.get("RUN_MODE", "daily")
-    d     = (date.today() - timedelta(days=1)).isoformat()  # всегда вчера
-    label = f"вчера ({d})"
+    now_utc = datetime.now(timezone.utc)
+    now_msk = now_utc + timedelta(hours=3)
+    label   = f"сегодня ({now_msk.strftime('%d.%m, %H:%M')} МСК)"
+
+    today   = date.today().isoformat()
+    # Also include yesterday in case today's data isn't live yet
+    d_from  = (date.today() - timedelta(days=1)).isoformat()
 
     async with httpx.AsyncClient() as client:
-        stats: dict = {}
+        raw = await fetch_stats(client, d_from, today)
+        print(f"RAW STATS: {raw}")
 
-        # Fetch report (financial data)
-        try:
-            report_data = await fetch_report(client, d, d)
-            stats.update(extract_totals(report_data))
-        except httpx.HTTPStatusError as e:
-            print(f"report error: {e.response.status_code} {e.response.text[:200]}")
-            await tg_send(client, f"⚠️ report {e.response.status_code}: <code>{e.response.text[:200]}</code>")
+        m = calc_metrics(raw)
+        print(f"METRICS: { {k:v for k,v in m.items() if k != '_raw'} }")
 
-        # Small delay to avoid rate limiting
-        await asyncio.sleep(2)
+        prev = load_state()
 
-        # Fetch traffic (visits, registrations)
-        try:
-            traffic_data = await fetch_traffic(client, d, d)
-            stats.update(extract_totals(traffic_data))
-        except httpx.HTTPStatusError as e:
-            print(f"traffic error: {e.response.status_code} {e.response.text[:200]}")
+        # Always send hourly report
+        await tg(client, fmt_report(m, label))
 
-        print(f"STATS: {stats}")
+        # Check conversion alerts
+        if prev:
+            alert = check_alerts(prev, m)
+            if alert:
+                await tg(client,
+                    f"⚠️ <b>Traffizy — падение конверсии!</b>\n\n{alert}")
 
-        if mode == "daily":
-            await tg_send(client, format_stats(stats, label))
-
-        elif mode == "check":
-            prev = load_prev()
-            if not prev:
-                # Первый запуск — сохраняем baseline, ничего не отправляем
-                print("No prev stats, saving baseline")
-            else:
-                lines = []
-                for key in ("visits", "registrations", "first_deposits_count", "deposits_sum"):
-                    old, new = prev.get(key), stats.get(key)
-                    if old and new and old != 0:
-                        delta = (new - old) / old
-                        if abs(delta) >= 0.30:
-                            arrow = "📈" if delta > 0 else "📉"
-                            lines.append(f"{arrow} <b>{key}</b>: {old:,.0f}→{new:,.0f} ({delta:+.0%})")
-                if lines:
-                    await tg_send(client, "⚡️ <b>Traffizy — изменение трафика</b>\n\n" + "\n".join(lines))
-
-        save_prev(stats)
+        save_state(m)
 
 
 if __name__ == "__main__":
