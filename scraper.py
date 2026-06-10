@@ -176,34 +176,25 @@ def save_state(s: dict):
 async def fetch_traffic_report(client: httpx.AsyncClient,
                                d_from: str, d_to: str) -> dict:
     """
-    GET /api/customer/v1/casino/traffic_report  group_by[]=brand
-    Returns {brand_id: unique_clicks} mapping.
+    GET /api/customer/v1/casino/traffic_report
+    Returns flat dict of totals: clicks, visits (unique), registrations_count, etc.
     """
-    params = [
-        ("from",       d_from),
-        ("to",         d_to),
-        ("group_by[]", "brand"),
-    ]
+    params = [("from", d_from), ("to", d_to)]
     try:
         r = await client.get(
             f"{BASE_URL}/api/customer/v1/casino/traffic_report",
             headers=HEADERS, params=params, timeout=30,
         )
-        print(f"traffic_report → {r.status_code}: {r.text[:400]}")
+        print(f"traffic_report → {r.status_code}: {r.text[:500]}")
         if r.status_code != 200:
             return {}
         data = r.json()
-        rows = data if isinstance(data, list) else (
-            data.get("rows", {}).get("data", []) or
-            data.get("totals", {}).get("data", [])
-        )
-        result = {}
-        for row in rows:
-            d = parse_row(row) if isinstance(row, list) else row
-            bid = d.get("brand_id")
-            if bid:
-                result[bid] = d.get("unique_visits_count") or d.get("unique_clicks") or 0
-        return result
+        rows = data.get("rows", {}).get("data", []) if isinstance(data, dict) else data
+        if not rows:
+            return {}
+        # First row = totals
+        row = rows[0]
+        return parse_row(row) if isinstance(row, list) else row
     except Exception as e:
         print(f"traffic_report error: {e}")
         return {}
@@ -234,9 +225,9 @@ async def main():
     new_state: dict = {}
 
     async with httpx.AsyncClient() as client:
-        # Get unique clicks per brand (best effort, skip on 429)
-        unique_map = await fetch_traffic_report(client, today, today)
-        print(f"Unique clicks map: {unique_map}")
+        # Get unique clicks totals from traffic_report
+        traffic_totals = await fetch_traffic_report(client, today, today)
+        print(f"Traffic totals: {traffic_totals}")
 
         await asyncio.sleep(3)
 
@@ -258,9 +249,7 @@ async def main():
             # Row is a list of {name, value, type} — convert to dict first
             d    = parse_row(row) if isinstance(row, list) else row
             bid  = d.get("brand_id")
-            name = brand_name(d, brand_map)
-            # Inject unique clicks from traffic_report
-            d["unique_visits_count"] = unique_map.get(bid, 0)
+            name = brand_name(d, {})
             m    = row_to_metrics(d)
             key  = str(bid or name)
 
