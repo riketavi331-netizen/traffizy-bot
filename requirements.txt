@@ -1,1 +1,54 @@
-httpx==0.27.0
+name: Traffizy → Telegram
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+    - cron: "0 0,12,18 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Режим запуска'
+        required: false
+        default: 'daily'
+        type: choice
+        options:
+          - daily
+          - check
+
+jobs:
+  send-stats:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Determine run mode
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "mode=${{ inputs.mode }}" >> $GITHUB_OUTPUT
+          else
+            HOUR=$(date -u +%H)
+            if [ "$HOUR" = "06" ]; then
+              echo "mode=daily" >> $GITHUB_OUTPUT
+            else
+              echo "mode=check" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Run
+        env:
+          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          STATISTIC_TOKEN:  ${{ secrets.STATISTIC_TOKEN }}
+          RUN_MODE:         ${{ steps.mode.outputs.mode }}
+        run: python scraper.py
