@@ -2,7 +2,7 @@ name: Traffizy → Telegram
 
 on:
   schedule:
-    - cron: "0 * * * *"   # каждый час
+    - cron: "*/5 * * * *"
   workflow_dispatch:        # ручной запуск для теста
 
 jobs:
