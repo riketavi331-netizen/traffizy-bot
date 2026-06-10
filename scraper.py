@@ -53,6 +53,7 @@ async def tg(client: httpx.AsyncClient, text: str):
 
 async def api_get_with_retry(client: httpx.AsyncClient,
                              path: str, params: list) -> httpx.Response:
+    """GET with automatic retry on 429 (wait 10s and try once more)."""
     for attempt in range(2):
         r = await client.get(
             f"{BASE_URL}{path}",
@@ -71,6 +72,10 @@ async def api_get_with_retry(client: httpx.AsyncClient,
 
 async def fetch_report(client: httpx.AsyncClient,
                        d_from: str, d_to: str) -> list[dict]:
+    """
+    GET /api/customer/v1/casino/report
+    group_by[]=brand  →  one row per brand
+    """
     params = [
         ("from",               d_from),
         ("to",                 d_to),
@@ -95,9 +100,12 @@ async def fetch_report(client: httpx.AsyncClient,
     return totals if totals else []
 
 
-# ── Parse row format ──────────────────────────────────────────────────────────
+# ── Parse row format ─────────────────────────────────────────────────────────
+# API returns rows as list of {name, value, type} objects, not plain dicts.
+# Money values: {"currency":"USD","amount":"55.31","amount_cents":"5531.0"}
 
 def parse_row(row: list) -> dict:
+    """Convert [{name, value, type}, ...] → flat dict with numeric values."""
     out = {}
     for item in row:
         key = item["name"]
@@ -122,13 +130,15 @@ def row_to_metrics(d: dict) -> dict:
     regs   = d.get("registrations_count") or 0
     ftd    = d.get("first_deposits_count") or 0
     c2r = round(regs / clicks * 100, 2) if clicks else 0.0
+    c2d = round(ftd  / clicks * 100, 2) if clicks else 0.0
     r2d = round(ftd  / regs  * 100, 2) if regs  else 0.0
     return {"clicks": clicks, "unique": unique, "regs": regs,
-            "ftd": ftd, "c2r": c2r, "r2d": r2d}
+            "ftd": ftd, "c2r": c2r, "c2d": c2d, "r2d": r2d}
 
 
 def brand_name(d: dict, brand_map: dict) -> str:
     bid = d.get("brand_id")
+    # Check env BRAND_NAMES first, then API-fetched map
     if bid:
         name = BRAND_NAMES.get(str(bid)) or brand_map.get(bid)
         if name:
@@ -147,6 +157,7 @@ def fmt_report(m: dict, name: str, label: str) -> str:
     lines.append(f"🆕 FTDs: <b>{m['ftd']:,}</b>")
     lines.append("──────────────")
     lines.append(f"C2R: <b>{m['c2r']:.1f}%</b>  (click→reg)")
+    lines.append(f"C2D: <b>{m['c2d']:.1f}%</b>  (click→FTD)")
     lines.append(f"R2D: <b>{m['r2d']:.1f}%</b>  (reg→FTD)")
     if not m["clicks"] and not m["regs"]:
         lines.append("\n<i>Нет данных за период</i>")
@@ -164,14 +175,58 @@ def save_state(s: dict):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+async def fetch_traffic_report(client: httpx.AsyncClient,
+                               d_from: str, d_to: str) -> dict:
+    """
+    GET /api/customer/v1/casino/traffic_report
+    Returns flat dict of totals: clicks, visits (unique), registrations_count, etc.
+    """
+    params = [("from", d_from), ("to", d_to)]
+    try:
+        r = await client.get(
+            f"{BASE_URL}/api/customer/v1/casino/traffic_report",
+            headers=HEADERS, params=params, timeout=30,
+        )
+        print(f"traffic_report → {r.status_code}: {r.text[:500]}")
+        if r.status_code != 200:
+            return {}
+        data = r.json()
+        rows = data.get("rows", {}).get("data", []) if isinstance(data, dict) else data
+        if not rows:
+            return {}
+        # First row = totals
+        row = rows[0]
+        return parse_row(row) if isinstance(row, list) else row
+    except Exception as e:
+        print(f"traffic_report error: {e}")
+        return {}
+
+
+async def get_brand_map(client: httpx.AsyncClient) -> dict:
+    """Returns {brand_id: brand_name} mapping."""
+    try:
+        r = await client.get(
+            f"{BASE_URL}/api/client/partner/brands",
+            headers=HEADERS, timeout=30,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            items = data if isinstance(data, list) else data.get("data", [])
+            return {b["id"]: b["name"] for b in items if "id" in b and "name" in b}
+    except Exception as e:
+        print(f"brand_map error: {e}")
+    return {}
+
+
 async def main():
     now_msk = datetime.now(timezone.utc) + timedelta(hours=3)
     label   = f"сегодня ({now_msk.strftime('%d.%m, %H:%M')} МСК)"
     today   = date.today().isoformat()
 
     prev_state = load_state()
-    new_state: dict = dict(prev_state)
+    new_state: dict = dict(prev_state)  # carry over all existing state
 
+    # Send full report once per hour (track last report hour in state)
     last_report_hour = prev_state.get("__last_report_hour__")
     send_report = (last_report_hour != now_msk.strftime("%Y-%m-%d %H"))
 
@@ -208,7 +263,7 @@ async def main():
             prev = prev_state.get(key, {})
             if prev:
                 alerts = []
-                for metric, lbl in (("c2r", "C2R"), ("r2d", "R2D")):
+                for metric, lbl in (("c2r", "C2R"), ("c2d", "C2D"), ("r2d", "R2D")):
                     drop = prev.get(metric, 0) - m.get(metric, 0)
                     if prev.get(metric, 0) > 0 and drop >= ALERT_DROP_PP:
                         alerts.append(
