@@ -76,7 +76,7 @@ async def get_brands(client: httpx.AsyncClient) -> list[dict]:
 async def fetch_traffic(client: httpx.AsyncClient,
                         d_from: str, d_to: str,
                         brand_id: int | None = None) -> dict:
-    params: dict = {"from": d_from, "to": d_to, "group_by": "total"}
+    params: dict = {"from": d_from, "to": d_to, "group_by": "day"}
     if brand_id:
         params["brand_id"] = brand_id
     return await api_get(client, "/api/customer/v1/casino/traffic_report", params)
@@ -200,7 +200,7 @@ async def main():
     now_msk = datetime.now(timezone.utc) + timedelta(hours=3)
     label   = f"сегодня ({now_msk.strftime('%d.%m, %H:%M')} МСК)"
     today   = date.today().isoformat()
-    d_from  = (date.today() - timedelta(days=1)).isoformat()
+    d_from  = today  # только сегодня — именно это показывает дашборд
 
     prev_state = load_state()
     new_state: dict = {}
