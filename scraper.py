@@ -12,6 +12,8 @@ import httpx
 STATISTIC_TOKEN = os.environ["STATISTIC_TOKEN"]
 TG_TOKEN        = os.environ["TELEGRAM_TOKEN"]
 TG_CHAT         = os.environ["TELEGRAM_CHAT_ID"]
+# {"192": "Orowin", "193": "Sikkaro", ...} — добавляйте новые бренды сюда
+BRAND_NAMES: dict = json.loads(os.environ.get("BRAND_NAMES", "{}"))
 
 HOST       = "affiliate.traffizy.partners"
 BASE_URL   = f"https://{HOST}"
@@ -27,7 +29,6 @@ HEADERS = {
 
 COLUMNS = [
     "visits_count",
-    "unique_visits_count",
     "registrations_count",
     "first_deposits_count",
     "first_deposits_sum",
@@ -125,8 +126,11 @@ def row_to_metrics(d: dict) -> dict:
 
 def brand_name(d: dict, brand_map: dict) -> str:
     bid = d.get("brand_id")
-    if bid and bid in brand_map:
-        return brand_map[bid]
+    # Check env BRAND_NAMES first, then API-fetched map
+    if bid:
+        name = BRAND_NAMES.get(str(bid)) or brand_map.get(bid)
+        if name:
+            return name
     return f"Brand {bid}" if bid else "Traffizy"
 
 
@@ -158,6 +162,42 @@ def save_state(s: dict):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+async def fetch_traffic_report(client: httpx.AsyncClient,
+                               d_from: str, d_to: str) -> dict:
+    """
+    GET /api/customer/v1/casino/traffic_report  group_by[]=brand
+    Returns {brand_id: unique_clicks} mapping.
+    """
+    params = [
+        ("from",       d_from),
+        ("to",         d_to),
+        ("group_by[]", "brand"),
+    ]
+    try:
+        r = await client.get(
+            f"{BASE_URL}/api/customer/v1/casino/traffic_report",
+            headers=HEADERS, params=params, timeout=30,
+        )
+        print(f"traffic_report → {r.status_code}: {r.text[:400]}")
+        if r.status_code != 200:
+            return {}
+        data = r.json()
+        rows = data if isinstance(data, list) else (
+            data.get("rows", {}).get("data", []) or
+            data.get("totals", {}).get("data", [])
+        )
+        result = {}
+        for row in rows:
+            d = parse_row(row) if isinstance(row, list) else row
+            bid = d.get("brand_id")
+            if bid:
+                result[bid] = d.get("unique_visits_count") or d.get("unique_clicks") or 0
+        return result
+    except Exception as e:
+        print(f"traffic_report error: {e}")
+        return {}
+
+
 async def get_brand_map(client: httpx.AsyncClient) -> dict:
     """Returns {brand_id: brand_name} mapping."""
     try:
@@ -187,6 +227,10 @@ async def main():
         brand_map = await get_brand_map(client)
         print(f"Brand map: {brand_map}")
 
+        # Get unique clicks per brand
+        unique_map = await fetch_traffic_report(client, today, today)
+        print(f"Unique clicks map: {unique_map}")
+
         try:
             rows = await fetch_report(client, today, today)
         except httpx.HTTPStatusError as e:
@@ -204,9 +248,12 @@ async def main():
         for row in rows:
             # Row is a list of {name, value, type} — convert to dict first
             d    = parse_row(row) if isinstance(row, list) else row
+            bid  = d.get("brand_id")
             name = brand_name(d, brand_map)
+            # Inject unique clicks from traffic_report
+            d["unique_visits_count"] = unique_map.get(bid, 0)
             m    = row_to_metrics(d)
-            key  = str(d.get("brand_id", name))
+            key  = str(bid or name)
 
             print(f"{name}: {m}")
             await tg(client, fmt_report(m, name, label))
