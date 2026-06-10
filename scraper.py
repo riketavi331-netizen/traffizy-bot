@@ -53,7 +53,6 @@ async def tg(client: httpx.AsyncClient, text: str):
 
 async def api_get_with_retry(client: httpx.AsyncClient,
                              path: str, params: list) -> httpx.Response:
-    """GET with automatic retry on 429 (wait 10s and try once more)."""
     for attempt in range(2):
         r = await client.get(
             f"{BASE_URL}{path}",
@@ -72,10 +71,6 @@ async def api_get_with_retry(client: httpx.AsyncClient,
 
 async def fetch_report(client: httpx.AsyncClient,
                        d_from: str, d_to: str) -> list[dict]:
-    """
-    GET /api/customer/v1/casino/report
-    group_by[]=brand  →  one row per brand
-    """
     params = [
         ("from",               d_from),
         ("to",                 d_to),
@@ -100,12 +95,9 @@ async def fetch_report(client: httpx.AsyncClient,
     return totals if totals else []
 
 
-# ── Parse row format ─────────────────────────────────────────────────────────
-# API returns rows as list of {name, value, type} objects, not plain dicts.
-# Money values: {"currency":"USD","amount":"55.31","amount_cents":"5531.0"}
+# ── Parse row format ──────────────────────────────────────────────────────────
 
 def parse_row(row: list) -> dict:
-    """Convert [{name, value, type}, ...] → flat dict with numeric values."""
     out = {}
     for item in row:
         key = item["name"]
@@ -137,7 +129,6 @@ def row_to_metrics(d: dict) -> dict:
 
 def brand_name(d: dict, brand_map: dict) -> str:
     bid = d.get("brand_id")
-    # Check env BRAND_NAMES first, then API-fetched map
     if bid:
         name = BRAND_NAMES.get(str(bid)) or brand_map.get(bid)
         if name:
@@ -173,64 +164,18 @@ def save_state(s: dict):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-async def fetch_traffic_report(client: httpx.AsyncClient,
-                               d_from: str, d_to: str) -> dict:
-    """
-    GET /api/customer/v1/casino/traffic_report
-    Returns flat dict of totals: clicks, visits (unique), registrations_count, etc.
-    """
-    params = [("from", d_from), ("to", d_to)]
-    try:
-        r = await client.get(
-            f"{BASE_URL}/api/customer/v1/casino/traffic_report",
-            headers=HEADERS, params=params, timeout=30,
-        )
-        print(f"traffic_report → {r.status_code}: {r.text[:500]}")
-        if r.status_code != 200:
-            return {}
-        data = r.json()
-        rows = data.get("rows", {}).get("data", []) if isinstance(data, dict) else data
-        if not rows:
-            return {}
-        # First row = totals
-        row = rows[0]
-        return parse_row(row) if isinstance(row, list) else row
-    except Exception as e:
-        print(f"traffic_report error: {e}")
-        return {}
-
-
-async def get_brand_map(client: httpx.AsyncClient) -> dict:
-    """Returns {brand_id: brand_name} mapping."""
-    try:
-        r = await client.get(
-            f"{BASE_URL}/api/client/partner/brands",
-            headers=HEADERS, timeout=30,
-        )
-        if r.status_code == 200:
-            data = r.json()
-            items = data if isinstance(data, list) else data.get("data", [])
-            return {b["id"]: b["name"] for b in items if "id" in b and "name" in b}
-    except Exception as e:
-        print(f"brand_map error: {e}")
-    return {}
-
-
 async def main():
     now_msk = datetime.now(timezone.utc) + timedelta(hours=3)
     label   = f"сегодня ({now_msk.strftime('%d.%m, %H:%M')} МСК)"
     today   = date.today().isoformat()
 
     prev_state = load_state()
-    new_state: dict = {}
+    new_state: dict = dict(prev_state)
+
+    last_report_hour = prev_state.get("__last_report_hour__")
+    send_report = (last_report_hour != now_msk.strftime("%Y-%m-%d %H"))
 
     async with httpx.AsyncClient() as client:
-        # Get unique clicks totals from traffic_report
-        traffic_totals = await fetch_traffic_report(client, today, today)
-        print(f"Traffic totals: {traffic_totals}")
-
-        await asyncio.sleep(3)
-
         try:
             rows = await fetch_report(client, today, today)
         except httpx.HTTPStatusError as e:
@@ -242,11 +187,11 @@ async def main():
         print(f"Rows received: {len(rows)}")
 
         if not rows:
-            await tg(client, f"📊 <b>Traffizy — {label}</b>\n\n<i>Нет данных за сегодня</i>")
+            if send_report:
+                await tg(client, f"📊 <b>Traffizy — {label}</b>\n\n<i>Нет данных за сегодня</i>")
             return
 
         for row in rows:
-            # Row is a list of {name, value, type} — convert to dict first
             d    = parse_row(row) if isinstance(row, list) else row
             bid  = d.get("brand_id")
             name = brand_name(d, {})
@@ -254,9 +199,12 @@ async def main():
             key  = str(bid or name)
 
             print(f"{name}: {m}")
-            await tg(client, fmt_report(m, name, label))
 
-            # Conversion alert
+            # Full report — once per hour
+            if send_report:
+                await tg(client, fmt_report(m, name, label))
+
+            # Conversion alert — every run
             prev = prev_state.get(key, {})
             if prev:
                 alerts = []
@@ -272,6 +220,9 @@ async def main():
                         + "\n".join(alerts))
 
             new_state[key] = m
+
+        if send_report:
+            new_state["__last_report_hour__"] = now_msk.strftime("%Y-%m-%d %H")
 
     save_state(new_state)
 
