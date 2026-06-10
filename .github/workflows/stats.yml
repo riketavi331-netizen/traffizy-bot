@@ -30,11 +30,10 @@ jobs:
 
       - name: Run
         env:
-          TRAFFIZY_EMAIL:    ${{ secrets.TRAFFIZY_EMAIL }}
-          TRAFFIZY_PASSWORD: ${{ secrets.TRAFFIZY_PASSWORD }}
           STATISTIC_TOKEN:   ${{ secrets.STATISTIC_TOKEN }}
           TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
+          BRAND_NAMES:       ${{ secrets.BRAND_NAMES }}
         run: python scraper.py
 
       - name: Save state
