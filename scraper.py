@@ -300,7 +300,8 @@ async def main():
     new_state: dict = dict(prev_state)
 
     last_report_hour = prev_state.get("__last_report_hour__")
-    send_report = (last_report_hour != now_utc.strftime("%Y-%m-%d %H"))
+    is_manual = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+    send_report = is_manual or (last_report_hour != now_utc.strftime("%Y-%m-%d %H"))
 
     async with httpx.AsyncClient() as client:
         try:
