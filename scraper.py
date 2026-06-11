@@ -100,38 +100,6 @@ async def fetch_report(client: httpx.AsyncClient,
     return totals if totals else []
 
 
-async def fetch_hourly_breakdown(client: httpx.AsyncClient,
-                                  d_from: str, d_to: str,
-                                  brand_id=None) -> list[dict]:
-    """
-    GET /api/customer/v1/casino/report
-    group_by[]=hour  →  one row per hour
-    """
-    params = [
-        ("from",               d_from),
-        ("to",                 d_to),
-        ("async",              "false"),
-        ("exchange_rates_date","2024-01-01"),
-    ]
-    for col in COLUMNS:
-        params.append(("columns[]", col))
-    params.append(("group_by[]", "hour"))
-    if brand_id is not None:
-        params.append(("brand_id[]", str(brand_id)))
-
-    try:
-        r = await api_get_with_retry(client, "/api/customer/v1/casino/report", params)
-        print(f"hourly {r.status_code}: {r.text[:800]}")
-        if r.status_code != 200:
-            return []
-        data = r.json()
-        if isinstance(data, list):
-            return data
-        rows = data.get("rows", {}).get("data", [])
-        return rows if rows else []
-    except Exception as e:
-        print(f"hourly fetch error: {e}")
-        return []
 
 
 # ── Parse row format ─────────────────────────────────────────────────────────
@@ -180,50 +148,9 @@ def brand_name(d: dict, brand_map: dict) -> str:
     return f"Brand {bid}" if bid else "Traffizy"
 
 
-def extract_hour_label(d: dict) -> str:
-    """Extract HH:00 string from a row dict. Tries common field names."""
-    for field in ("hour", "date", "created_at", "time", "datetime"):
-        val = d.get(field)
-        if not val:
-            continue
-        s = str(val)
-        # "2024-01-01T12:00:00" or "2024-01-01 12:00:00"
-        if "T" in s:
-            s = s.split("T")[1]
-        elif " " in s and len(s) > 10:
-            s = s.split(" ")[1]
-        # "12:00:00" → "12:00"
-        if ":" in s:
-            return s[:5]
-        # plain integer hour "12"
-        if s.isdigit():
-            return f"{int(s):02d}:00"
-    return ""
-
-
 # ── Format ────────────────────────────────────────────────────────────────────
 
-def fmt_hourly(rows: list) -> str:
-    """Format hourly breakdown as compact table. Returns empty string if no data."""
-    lines = []
-    for row in rows:
-        d = parse_row(row) if isinstance(row, list) else row
-        hour = extract_hour_label(d)
-        m = row_to_metrics(d)
-        if not (m["clicks"] or m["regs"] or m["ftd"]):
-            continue
-        label = f"{hour}  " if hour else ""
-        lines.append(
-            f"{label}C2R <b>{m['c2r']:.1f}%</b>  "
-            f"R2D <b>{m['r2d']:.1f}%</b>  "
-            f"C2D <b>{m['c2d']:.1f}%</b>"
-        )
-    if not lines:
-        return ""
-    return "📈 <b>По часам (UTC):</b>\n" + "\n".join(lines)
-
-
-def fmt_report(m: dict, name: str, label: str, hourly_str: str = "") -> str:
+def fmt_report(m: dict, name: str, label: str) -> str:
     lines = [f"📊 <b>{name} — {label}</b>", ""]
     lines.append(f"👆 All clicks: <b>{m['clicks']:,}</b>")
     if m["unique"]:
@@ -236,9 +163,6 @@ def fmt_report(m: dict, name: str, label: str, hourly_str: str = "") -> str:
     lines.append(f"R2D: <b>{m['r2d']:.1f}%</b>  (reg→FTD)")
     if not m["clicks"] and not m["regs"]:
         lines.append("\n<i>Нет данных за период</i>")
-    if hourly_str:
-        lines.append("")
-        lines.append(hourly_str)
     return "\n".join(lines)
 
 
@@ -329,9 +253,7 @@ async def main():
             print(f"{name}: {m}")
 
             if send_report:
-                hourly_rows = await fetch_hourly_breakdown(client, today, today, brand_id=bid)
-                hourly_str  = fmt_hourly(hourly_rows)
-                await tg(client, fmt_report(m, name, label, hourly_str))
+                await tg(client, fmt_report(m, name, label))
 
             prev = prev_state.get(key, {})
             if prev:
