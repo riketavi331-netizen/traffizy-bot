@@ -100,6 +100,40 @@ async def fetch_report(client: httpx.AsyncClient,
     return totals if totals else []
 
 
+async def fetch_hourly_breakdown(client: httpx.AsyncClient,
+                                  d_from: str, d_to: str,
+                                  brand_id=None) -> list[dict]:
+    """
+    GET /api/customer/v1/casino/report
+    group_by[]=hour  →  one row per hour
+    """
+    params = [
+        ("from",               d_from),
+        ("to",                 d_to),
+        ("async",              "false"),
+        ("exchange_rates_date","2024-01-01"),
+    ]
+    for col in COLUMNS:
+        params.append(("columns[]", col))
+    params.append(("group_by[]", "hour"))
+    if brand_id is not None:
+        params.append(("brand_id[]", str(brand_id)))
+
+    try:
+        r = await api_get_with_retry(client, "/api/customer/v1/casino/report", params)
+        print(f"hourly body: {r.text[:600]}")
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        if isinstance(data, list):
+            return data
+        rows = data.get("rows", {}).get("data", [])
+        return rows if rows else []
+    except Exception as e:
+        print(f"hourly fetch error: {e}")
+        return []
+
+
 # ── Parse row format ─────────────────────────────────────────────────────────
 # API returns rows as list of {name, value, type} objects, not plain dicts.
 # Money values: {"currency":"USD","amount":"55.31","amount_cents":"5531.0"}
@@ -146,9 +180,50 @@ def brand_name(d: dict, brand_map: dict) -> str:
     return f"Brand {bid}" if bid else "Traffizy"
 
 
+def extract_hour_label(d: dict) -> str:
+    """Extract HH:00 string from a row dict. Tries common field names."""
+    for field in ("hour", "date", "created_at", "time", "datetime"):
+        val = d.get(field)
+        if not val:
+            continue
+        s = str(val)
+        # "2024-01-01T12:00:00" or "2024-01-01 12:00:00"
+        if "T" in s:
+            s = s.split("T")[1]
+        elif " " in s and len(s) > 10:
+            s = s.split(" ")[1]
+        # "12:00:00" → "12:00"
+        if ":" in s:
+            return s[:5]
+        # plain integer hour "12"
+        if s.isdigit():
+            return f"{int(s):02d}:00"
+    return ""
+
+
 # ── Format ────────────────────────────────────────────────────────────────────
 
-def fmt_report(m: dict, name: str, label: str) -> str:
+def fmt_hourly(rows: list) -> str:
+    """Format hourly breakdown as compact table. Returns empty string if no data."""
+    lines = []
+    for row in rows:
+        d = parse_row(row) if isinstance(row, list) else row
+        hour = extract_hour_label(d)
+        m = row_to_metrics(d)
+        if not (m["clicks"] or m["regs"] or m["ftd"]):
+            continue
+        label = f"{hour}  " if hour else ""
+        lines.append(
+            f"{label}C2R <b>{m['c2r']:.1f}%</b>  "
+            f"R2D <b>{m['r2d']:.1f}%</b>  "
+            f"C2D <b>{m['c2d']:.1f}%</b>"
+        )
+    if not lines:
+        return ""
+    return "📈 <b>По часам (UTC):</b>\n" + "\n".join(lines)
+
+
+def fmt_report(m: dict, name: str, label: str, hourly_str: str = "") -> str:
     lines = [f"📊 <b>{name} — {label}</b>", ""]
     lines.append(f"👆 All clicks: <b>{m['clicks']:,}</b>")
     if m["unique"]:
@@ -161,6 +236,9 @@ def fmt_report(m: dict, name: str, label: str) -> str:
     lines.append(f"R2D: <b>{m['r2d']:.1f}%</b>  (reg→FTD)")
     if not m["clicks"] and not m["regs"]:
         lines.append("\n<i>Нет данных за период</i>")
+    if hourly_str:
+        lines.append("")
+        lines.append(hourly_str)
     return "\n".join(lines)
 
 
@@ -177,10 +255,6 @@ def save_state(s: dict):
 
 async def fetch_traffic_report(client: httpx.AsyncClient,
                                d_from: str, d_to: str) -> dict:
-    """
-    GET /api/customer/v1/casino/traffic_report
-    Returns flat dict of totals: clicks, visits (unique), registrations_count, etc.
-    """
     params = [("from", d_from), ("to", d_to)]
     try:
         r = await client.get(
@@ -194,7 +268,6 @@ async def fetch_traffic_report(client: httpx.AsyncClient,
         rows = data.get("rows", {}).get("data", []) if isinstance(data, dict) else data
         if not rows:
             return {}
-        # First row = totals
         row = rows[0]
         return parse_row(row) if isinstance(row, list) else row
     except Exception as e:
@@ -219,16 +292,15 @@ async def get_brand_map(client: httpx.AsyncClient) -> dict:
 
 
 async def main():
-    now_msk = datetime.now(timezone.utc) + timedelta(hours=3)
-    label   = f"сегодня ({now_msk.strftime('%d.%m, %H:%M')} МСК)"
+    now_utc = datetime.now(timezone.utc)
+    label   = f"сегодня ({now_utc.strftime('%d.%m, %H:%M')} UTC)"
     today   = date.today().isoformat()
 
     prev_state = load_state()
-    new_state: dict = dict(prev_state)  # carry over all existing state
+    new_state: dict = dict(prev_state)
 
-    # Send full report once per hour (track last report hour in state)
     last_report_hour = prev_state.get("__last_report_hour__")
-    send_report = (last_report_hour != now_msk.strftime("%Y-%m-%d %H"))
+    send_report = (last_report_hour != now_utc.strftime("%Y-%m-%d %H"))
 
     async with httpx.AsyncClient() as client:
         try:
@@ -255,11 +327,11 @@ async def main():
 
             print(f"{name}: {m}")
 
-            # Full report — once per hour
             if send_report:
-                await tg(client, fmt_report(m, name, label))
+                hourly_rows = await fetch_hourly_breakdown(client, today, today, brand_id=bid)
+                hourly_str  = fmt_hourly(hourly_rows)
+                await tg(client, fmt_report(m, name, label, hourly_str))
 
-            # Conversion alert — every run
             prev = prev_state.get(key, {})
             if prev:
                 alerts = []
@@ -277,7 +349,7 @@ async def main():
             new_state[key] = m
 
         if send_report:
-            new_state["__last_report_hour__"] = now_msk.strftime("%Y-%m-%d %H")
+            new_state["__last_report_hour__"] = now_utc.strftime("%Y-%m-%d %H")
 
     save_state(new_state)
 
