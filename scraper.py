@@ -121,7 +121,7 @@ async def fetch_hourly_breakdown(client: httpx.AsyncClient,
 
     try:
         r = await api_get_with_retry(client, "/api/customer/v1/casino/report", params)
-        print(f"hourly body: {r.text[:600]}")
+        print(f"hourly {r.status_code}: {r.text[:800]}")
         if r.status_code != 200:
             return []
         data = r.json()
