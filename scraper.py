@@ -97,6 +97,31 @@ async def fetch_report(client: httpx.AsyncClient,
     return _extract_rows(r.json())
 
 
+async def fetch_daily_breakdown(client: httpx.AsyncClient,
+                               d_from: str, d_to: str) -> list:
+    """group_by[]=day&group_by[]=brand — one row per day per brand."""
+    params = [
+        ("from",               d_from),
+        ("to",                 d_to),
+        ("async",              "false"),
+        ("exchange_rates_date","2024-01-01"),
+    ]
+    for col in COLUMNS:
+        params.append(("columns[]", col))
+    params.append(("group_by[]", "day"))
+    params.append(("group_by[]", "brand"))
+
+    try:
+        r = await api_get_with_retry(client, "/api/customer/v1/casino/report", params)
+        print(f"daily {r.status_code}: {r.text[:400]}")
+        if r.status_code != 200:
+            return []
+        return _extract_rows(r.json())
+    except Exception as e:
+        print(f"daily fetch error: {e}")
+        return []
+
+
 async def fetch_affiliate_breakdown(client: httpx.AsyncClient,
                                     d_from: str, d_to: str,
                                     brand_id=None) -> list:
@@ -109,9 +134,8 @@ async def fetch_affiliate_breakdown(client: httpx.AsyncClient,
     ]
     for col in COLUMNS:
         params.append(("columns[]", col))
+    params.append(("group_by[]", "brand"))
     params.append(("group_by[]", "partner"))
-    if brand_id is not None:
-        params.append(("brand_id[]", str(brand_id)))
 
     try:
         r = await api_get_with_retry(client, "/api/customer/v1/casino/report", params)
@@ -177,10 +201,12 @@ def affiliate_label(d: dict) -> str:
 
 # ── Format ────────────────────────────────────────────────────────────────────
 
-def fmt_affiliates(rows: list) -> str:
+def fmt_affiliates(rows: list, filter_brand_id=None) -> str:
     lines = []
     for row in rows:
         d = parse_row(row) if isinstance(row, list) else row
+        if filter_brand_id is not None and d.get("brand_id") != filter_brand_id:
+            continue
         m = row_to_metrics(d)
         if not (m["clicks"] or m["regs"] or m["ftd"]):
             continue
@@ -193,6 +219,34 @@ def fmt_affiliates(rows: list) -> str:
     if not lines:
         return ""
     return "👥 <b>По вебам:</b>\n" + "\n".join(lines)
+
+
+def fmt_daily(rows: list, filter_brand_id) -> str:
+    """Format 7-day dynamics for one brand as a compact table."""
+    lines = []
+    for row in rows:
+        d = parse_row(row) if isinstance(row, list) else row
+        if d.get("brand_id") != filter_brand_id:
+            continue
+        # date field: "2026-06-12T00:00:00.000Z" or "2026-06-12"
+        date_val = d.get("date") or d.get("day") or ""
+        date_str = str(date_val)[:10]  # "2026-06-12"
+        try:
+            dt = datetime.strptime(date_str, "%Y-%m-%d")
+            date_label = dt.strftime("%d.%m")
+        except ValueError:
+            date_label = date_str
+        m = row_to_metrics(d)
+        if not (m["clicks"] or m["regs"] or m["ftd"]):
+            continue
+        lines.append(
+            f"{date_label}  "
+            f"👆{m['clicks']} 📝{m['regs']} 💰{m['ftd']}  "
+            f"C2R {m['c2r']:.1f}%  R2D {m['r2d']:.1f}%  C2D {m['c2d']:.1f}%"
+        )
+    if not lines:
+        return ""
+    return "\n".join(lines)
 
 
 def fmt_report(m: dict, name: str, label: str, affiliates_str: str = "") -> str:
@@ -251,8 +305,11 @@ async def main():
     new_state: dict = dict(prev_state)
 
     last_report_hour = prev_state.get("__last_report_hour__")
+    last_daily_report = prev_state.get("__last_daily_report__")
     force = os.environ.get("FORCE_REPORT", "").lower() == "true"
     send_report = force or (last_report_hour != now_utc.strftime("%Y-%m-%d %H"))
+    # Daily dynamics sent once per day at 10:00 UTC
+    send_daily = force or (now_utc.hour == 10 and last_daily_report != today)
 
     async with httpx.AsyncClient() as client:
         try:
@@ -270,6 +327,16 @@ async def main():
                 await tg(client, f"📊 <b>Traffizy — {label}</b>\n\n<i>Нет данных за сегодня</i>")
             return
 
+        # Fetch partner breakdown once with brand+partner grouping
+        aff_rows = await fetch_affiliate_breakdown(client, today, today) if send_report else []
+
+        # Fetch 7-day dynamics once per day
+        if send_daily:
+            week_from = (date.today() - timedelta(days=6)).isoformat()
+            daily_rows = await fetch_daily_breakdown(client, week_from, today)
+        else:
+            daily_rows = []
+
         for row in rows:
             d    = parse_row(row) if isinstance(row, list) else row
             bid  = d.get("brand_id")
@@ -280,9 +347,14 @@ async def main():
             print(f"{name}: {m}")
 
             if send_report:
-                aff_rows = await fetch_affiliate_breakdown(client, today, today, brand_id=bid)
-                aff_str  = fmt_affiliates(aff_rows)
+                aff_str = fmt_affiliates(aff_rows, filter_brand_id=bid)
                 await tg(client, fmt_report(m, name, label, aff_str))
+
+            if send_daily and daily_rows:
+                daily_str = fmt_daily(daily_rows, filter_brand_id=bid)
+                if daily_str:
+                    await tg(client,
+                        f"📅 <b>{name} — динамика 7 дней</b>\n\n{daily_str}")
 
             prev = prev_state.get(key, {})
             if prev:
@@ -302,6 +374,8 @@ async def main():
 
         if send_report:
             new_state["__last_report_hour__"] = now_utc.strftime("%Y-%m-%d %H")
+        if send_daily:
+            new_state["__last_daily_report__"] = today
 
     save_state(new_state)
 
