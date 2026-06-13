@@ -327,8 +327,8 @@ async def main():
                 await tg(client, f"📊 <b>Traffizy — {label}</b>\n\n<i>Нет данных за сегодня</i>")
             return
 
-        # Fetch partner breakdown once with brand+partner grouping
-        aff_rows = await fetch_affiliate_breakdown(client, today, today) if send_report else []
+        # Fetch partner breakdown every run (for alerts) + hourly report
+        aff_rows = await fetch_affiliate_breakdown(client, today, today)
 
         # Fetch 7-day dynamics once per day
         if send_daily:
@@ -371,6 +371,32 @@ async def main():
                         + "\n".join(alerts))
 
             new_state[key] = m
+
+        # Per-partner alert check (every run)
+        for row in aff_rows:
+            d   = parse_row(row) if isinstance(row, list) else row
+            bid = d.get("brand_id")
+            pid = d.get("partner_id") or d.get("affiliate_id") or d.get("id")
+            if not pid:
+                continue
+            pname  = affiliate_label(d)
+            bname  = brand_name(d)
+            m      = row_to_metrics(d)
+            pkey   = f"partner_{bid}_{pid}"
+            prev_p = prev_state.get(pkey, {})
+            if prev_p:
+                alerts = []
+                for metric, lbl in (("c2r", "C2R"), ("c2d", "C2D"), ("r2d", "R2D")):
+                    drop = prev_p.get(metric, 0) - m.get(metric, 0)
+                    if prev_p.get(metric, 0) > 0 and drop >= ALERT_DROP_PP:
+                        alerts.append(
+                            f"📉 <b>{lbl}</b>: {prev_p[metric]:.1f}% → "
+                            f"{m[metric]:.1f}% (−{drop:.1f}pp)")
+                if alerts:
+                    await tg(client,
+                        f"⚠️ <b>{pname} ({bname}) — падение конверсии!</b>\n\n"
+                        + "\n".join(alerts))
+            new_state[pkey] = m
 
         if send_report:
             new_state["__last_report_hour__"] = now_utc.strftime("%Y-%m-%d %H")
