@@ -12,7 +12,7 @@ import httpx
 STATISTIC_TOKEN = os.environ["STATISTIC_TOKEN"]
 TG_TOKEN        = os.environ["TELEGRAM_TOKEN"]
 TG_CHAT         = os.environ["TELEGRAM_CHAT_ID"]
-# {"192": "Orowin", "193": "Sikkaro", ...} — добавляйте новые бренды сюда
+# {"192": "Orowin", "193": "Sikkaro", ...}
 BRAND_NAMES: dict = json.loads(os.environ.get("BRAND_NAMES", "{}"))
 
 HOST       = "affiliate.traffizy.partners"
@@ -53,7 +53,6 @@ async def tg(client: httpx.AsyncClient, text: str):
 
 async def api_get_with_retry(client: httpx.AsyncClient,
                              path: str, params: list) -> httpx.Response:
-    """GET with automatic retry on 429 (wait 10s and try once more)."""
     for attempt in range(2):
         r = await client.get(
             f"{BASE_URL}{path}",
@@ -70,12 +69,18 @@ async def api_get_with_retry(client: httpx.AsyncClient,
     return r
 
 
+def _extract_rows(data) -> list:
+    if isinstance(data, list):
+        return data
+    rows = data.get("rows", {}).get("data", [])
+    if rows:
+        return rows
+    return data.get("totals", {}).get("data", [])
+
+
 async def fetch_report(client: httpx.AsyncClient,
-                       d_from: str, d_to: str) -> list[dict]:
-    """
-    GET /api/customer/v1/casino/report
-    group_by[]=brand  →  one row per brand
-    """
+                       d_from: str, d_to: str) -> list:
+    """group_by[]=brand — one row per brand."""
     params = [
         ("from",               d_from),
         ("to",                 d_to),
@@ -89,25 +94,39 @@ async def fetch_report(client: httpx.AsyncClient,
     r = await api_get_with_retry(client, "/api/customer/v1/casino/report", params)
     print(f"report body: {r.text[:600]}")
     r.raise_for_status()
-
-    data = r.json()
-    if isinstance(data, list):
-        return data
-    rows = data.get("rows", {}).get("data", [])
-    if rows:
-        return rows
-    totals = data.get("totals", {}).get("data", [])
-    return totals if totals else []
+    return _extract_rows(r.json())
 
 
+async def fetch_affiliate_breakdown(client: httpx.AsyncClient,
+                                    d_from: str, d_to: str,
+                                    brand_id=None) -> list:
+    """group_by[]=partner — one row per webmaster."""
+    params = [
+        ("from",               d_from),
+        ("to",                 d_to),
+        ("async",              "false"),
+        ("exchange_rates_date","2024-01-01"),
+    ]
+    for col in COLUMNS:
+        params.append(("columns[]", col))
+    params.append(("group_by[]", "partner"))
+    if brand_id is not None:
+        params.append(("brand_id[]", str(brand_id)))
+
+    try:
+        r = await api_get_with_retry(client, "/api/customer/v1/casino/report", params)
+        print(f"partner {r.status_code}: {r.text[:600]}")
+        if r.status_code != 200:
+            return []
+        return _extract_rows(r.json())
+    except Exception as e:
+        print(f"partner fetch error: {e}")
+        return []
 
 
 # ── Parse row format ─────────────────────────────────────────────────────────
-# API returns rows as list of {name, value, type} objects, not plain dicts.
-# Money values: {"currency":"USD","amount":"55.31","amount_cents":"5531.0"}
 
 def parse_row(row: list) -> dict:
-    """Convert [{name, value, type}, ...] → flat dict with numeric values."""
     out = {}
     for item in row:
         key = item["name"]
@@ -138,19 +157,45 @@ def row_to_metrics(d: dict) -> dict:
             "ftd": ftd, "c2r": c2r, "c2d": c2d, "r2d": r2d}
 
 
-def brand_name(d: dict, brand_map: dict) -> str:
+def brand_name(d: dict) -> str:
     bid = d.get("brand_id")
-    # Check env BRAND_NAMES first, then API-fetched map
     if bid:
-        name = BRAND_NAMES.get(str(bid)) or brand_map.get(bid)
+        name = BRAND_NAMES.get(str(bid))
         if name:
             return name
     return f"Brand {bid}" if bid else "Traffizy"
 
 
+def affiliate_label(d: dict) -> str:
+    for field in ("partner_name", "partner", "affiliate_name", "affiliate", "name", "login", "email"):
+        val = d.get(field)
+        if val and isinstance(val, str):
+            return val
+    aid = d.get("partner_id") or d.get("affiliate_id") or d.get("id")
+    return f"#{aid}" if aid else "—"
+
+
 # ── Format ────────────────────────────────────────────────────────────────────
 
-def fmt_report(m: dict, name: str, label: str) -> str:
+def fmt_affiliates(rows: list) -> str:
+    lines = []
+    for row in rows:
+        d = parse_row(row) if isinstance(row, list) else row
+        m = row_to_metrics(d)
+        if not (m["clicks"] or m["regs"] or m["ftd"]):
+            continue
+        label = affiliate_label(d)
+        lines.append(
+            f"<b>{label}</b>  "
+            f"👆{m['clicks']} 📝{m['regs']} 💰{m['ftd']}  "
+            f"C2R {m['c2r']:.1f}% R2D {m['r2d']:.1f}% C2D {m['c2d']:.1f}%"
+        )
+    if not lines:
+        return ""
+    return "👥 <b>По вебам:</b>\n" + "\n".join(lines)
+
+
+def fmt_report(m: dict, name: str, label: str, affiliates_str: str = "") -> str:
     lines = [f"📊 <b>{name} — {label}</b>", ""]
     lines.append(f"👆 All clicks: <b>{m['clicks']:,}</b>")
     if m["unique"]:
@@ -163,6 +208,9 @@ def fmt_report(m: dict, name: str, label: str) -> str:
     lines.append(f"R2D: <b>{m['r2d']:.1f}%</b>  (reg→FTD)")
     if not m["clicks"] and not m["regs"]:
         lines.append("\n<i>Нет данных за период</i>")
+    if affiliates_str:
+        lines.append("")
+        lines.append(affiliates_str)
     return "\n".join(lines)
 
 
@@ -175,32 +223,9 @@ def save_state(s: dict):
     STATE_FILE.write_text(json.dumps(s))
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-
-async def fetch_traffic_report(client: httpx.AsyncClient,
-                               d_from: str, d_to: str) -> dict:
-    params = [("from", d_from), ("to", d_to)]
-    try:
-        r = await client.get(
-            f"{BASE_URL}/api/customer/v1/casino/traffic_report",
-            headers=HEADERS, params=params, timeout=30,
-        )
-        print(f"traffic_report → {r.status_code}: {r.text[:500]}")
-        if r.status_code != 200:
-            return {}
-        data = r.json()
-        rows = data.get("rows", {}).get("data", []) if isinstance(data, dict) else data
-        if not rows:
-            return {}
-        row = rows[0]
-        return parse_row(row) if isinstance(row, list) else row
-    except Exception as e:
-        print(f"traffic_report error: {e}")
-        return {}
-
+# ── Unused helpers kept for reference ─────────────────────────────────────────
 
 async def get_brand_map(client: httpx.AsyncClient) -> dict:
-    """Returns {brand_id: brand_name} mapping."""
     try:
         r = await client.get(
             f"{BASE_URL}/api/client/partner/brands",
@@ -214,6 +239,8 @@ async def get_brand_map(client: httpx.AsyncClient) -> dict:
         print(f"brand_map error: {e}")
     return {}
 
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 async def main():
     now_utc = datetime.now(timezone.utc)
@@ -246,14 +273,16 @@ async def main():
         for row in rows:
             d    = parse_row(row) if isinstance(row, list) else row
             bid  = d.get("brand_id")
-            name = brand_name(d, {})
+            name = brand_name(d)
             m    = row_to_metrics(d)
             key  = str(bid or name)
 
             print(f"{name}: {m}")
 
             if send_report:
-                await tg(client, fmt_report(m, name, label))
+                aff_rows = await fetch_affiliate_breakdown(client, today, today, brand_id=bid)
+                aff_str  = fmt_affiliates(aff_rows)
+                await tg(client, fmt_report(m, name, label, aff_str))
 
             prev = prev_state.get(key, {})
             if prev:
